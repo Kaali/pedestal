@@ -11,8 +11,10 @@
 
 (ns io.pedestal.service.http.body-params
   (:require [clojure.edn :as edn]
-            [clojure.data.json :as json]
+            [cheshire.core :as json]
+            [cheshire.parse :as parse]
             [clojure.string :as str]
+            [clojure.walk :as walk]
             [io.pedestal.service.interceptor :as interceptor :refer [definterceptorfn]]
             [io.pedestal.service.log :as log]
             [ring.middleware.params :as params]))
@@ -75,6 +77,33 @@
   "Take a request and parse its body as edn."
   (custom-edn-parser))
 
+(defn- transform-map
+  [f m]
+  (walk/postwalk (fn [x]
+                   (if (map? x)
+                     (into {} (map (fn [[k v]] [k (f k v)]) x))
+                     x))
+                 m))
+
+(defn- json-read
+  "Emulate clojure.data.json/read options interface with Cheshire."
+  [reader & options]
+  (let [{:keys [eof-error? eof-value bigdec key-fn value-fn]
+         :or {bigdec false
+              eof-error? true
+              key-fn identity
+              value-fn nil}} options
+        transform (if value-fn transform-map identity)]
+    (binding [parse/*use-bigdecimals?* bigdec]
+      (try
+        (transform (json/parse-stream (java.io.PushbackReader. reader) key-fn))
+        (catch com.fasterxml.jackson.core.JsonParseException e
+          (if (.contains (str e) "Unexpected end-of-input")
+            (if eof-error?
+              (throw (java.io.EOFException. "JSON error (end-of-file)"))
+              eof-value)
+            (throw e)))))))
+
 (defn custom-json-parser
   "Return a json-parser fn that, given a request, will read the body of that
   request with `json/read`. options are key-val pairs that will be passed along
@@ -84,7 +113,7 @@
     (let [encoding (or (:character-encoding request) "UTF-8")]
       (assoc request
              :json-params
-             (apply json/read
+             (apply json-read
                     (-> (:body request)
                         (java.io.InputStreamReader. encoding))
                     options)))))
